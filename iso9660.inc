@@ -110,7 +110,7 @@ iso9660_user_functions:
 .end:
 endg
 
-; mount if it's a valid EXT partition
+; mount if it's a valid ISO9660 partition
 iso9660_create_partition:
 ;   in:
 ; ebp -> PARTITION structure
@@ -223,9 +223,9 @@ iso9660_free:
         jmp     free
 
 
-; functions fs
 
-; FAT external functions
+
+; ISO9660 external functions
 ;   in:
 ; ebx -> parameter structure of sysfunc 70
 ; ebp -> ISO9660 structure
@@ -236,6 +236,7 @@ iso9660_Read:
         sub     esp, 4 ; for ptr on memory page
         call    iso9660_find_file
         mov     esi, eax
+        mov     edi, [ebx + 16] ; ptr to programm buffer
 
         test    byte[esi + ISO9660_DIRECTORY_RECORD.flags], 10b ; check dir
         jnz     iso9660_find_file.not_found
@@ -247,34 +248,165 @@ iso9660_Read:
         jnz     iso9660_find_file.bad_offset ; error offset > max size
 
         add     eax, [ebx + 12] ;size copy data
-        jc      iso9660_find_file.bad_offset ; error offset > max size
+        jc      iso9660_find_file.bad_offset ; error offset + size > max size
 
         cmp     edx, [esi + ISO9660_DIRECTORY_RECORD.data_length]
         jae     iso9660_find_file.bad_offset ; error offset > file length
 
-         ; check end offset (offset+size_buff <= size)
+        ; good file - copy file data
+        sub     esp, 4*4            ; esp+3*4 = fs err code  esp+2*4= size copy data
+        mov     dword[esp + 3*4], 0 ; esp+1*4 = offset copy  esp = count copying data
+
+        mov     [esp + 2*4], eax ; copy finish offset
+        sub     [esp + 2*4], edx ; = size copy data
+        mov     [esp + 1*4], edx ; offset to start copy
+        mov     [esp], 0 ; count copping byte
+
+        ; check end offset (offset+size_buff <= size)
         cmp     eax, [esi + ISO9660_DIRECTORY_RECORD.data_length]
-        je      .no_full ; error offset+size_buff > file length
+        jbe      .full_size ;  offset+size_buff <= file length
 
+        ; read offset - (file size - offset)
+        mov     dword[esp + 3*4], 6
+        mov     eax, [esi + ISO9660_DIRECTORY_RECORD.data_length]
+        sub     eax, edx ;[esp + 1*4]
+        mov     dword[esp + 2*4], eax ; = size copy data
 
+.full_size:
+        ; check offset mod sector_size = 0
+        test    edx, not -2048
+        jz      .first_align ; no creat buffer for first align
 
+        push    edx
+        stdcall kernel_alloc, 4096  ; TODO
+        mov     ebx, eax
+        pop     edx
 
-        ; copy size_buff/2048 data
+        test    eax, eax
+        jz      .err_memory
 
-        ; if (buffer and 2048-1)
-        ;   alloc page memory
-        ;   get last sector file
-        ;   copy in byffer
+        ; read sector
+        push    edx ebx
 
+        and     edx, -2048
+        shr     edx, BSF 2048
+        mov     eax, [esi + ISO9660_DIRECTORY_RECORD.lba]
+        add     eax, edx
+        mov     ecx, 1
+        xor     edx, edx
+        ; ebx - buffer
+        ; edx:eax - num sector
+        ; ebp - PARTITION
+        ; ecx - number sectors
+        call    fs_read64_sys
+
+        pop     ebx edx
+        test    eax, eax
+        jnz     .err_disk_1
+
+        not     edx
+        and     edx, not -2048
+
+        add     dword[esp + 1*4], not -2048
+        and     dword[esp + 1*4], -2048
+        cmp     dword[esp + 2*4], edx
+        jb      @f
+        mov     edx, [esp + 2*4]
+@@:
+        sub     dword[esp + 2*4], edx
+        add     dword[esp], edx
+
+        push    esi
+        ; copy (2048 - offset) and -2048
+        mov     esi, ebx ; buffer
+        mov     ecx, edx
+        rep movsb
+        pop    esi
+
+        stdcall kernel_free, ebx
+.first_align:
+
+        mov     ecx, [esp + 2*4]
+        and     ecx, -2048
+
+        cmp     ecx, 2048
+        jb      .copy_finish_block
+
+        mov     eax, [esp + 1*4]
+        shr     eax, BSF 2048
+        ; copy main block
+        mov     ebx, edi
+        add     edi, ecx
+        sub     dword[esp + 2*4], ecx
+        add     dword[esp + 1*4], ecx
+        add     dword[esp], ecx
+
+        shr     ecx, BSF 2048
+        xor     edx, edx
+        add     eax, [esi + ISO9660_DIRECTORY_RECORD.lba]
+        ; ebx - buffer
+        ; edx:eax - num sector
+        ; ebp - PARTITION
+        ; ecx - number sectors
+        call    fs_read64_sys
+        test    eax, eax
+        jnz     .err_disk
+
+.copy_finish_block:
+
+        cmp     dword[esp + 2*4], 0
+        jz      .end_align ; creat buffer for end read sector
+
+        stdcall kernel_alloc, 4096
+        mov     ebx, eax
+        jz      .err_memory
+
+        ;copy finish block
+        mov     eax, [esp + 1*4]
+        shr     eax, BSF 2048
+        xor     edx, edx
+
+        mov     ecx, 1
+        add     eax, [esi + ISO9660_DIRECTORY_RECORD.lba]
+        ; ebx - buffer
+        ; edx:eax - num sector
+        ; ebp - PARTITION
+        ; ecx - number sectors
+        call    fs_read64_sys
+        test    eax, eax
+        jnz     .err_disk_1
+
+        mov     esi, ebx
+        mov     ecx, [esp + 2*4]
+        add     dword[esp], ecx
+        rep movsb
+
+        stdcall kernel_free, ebx
+
+.end_align:
         ; set ebx size copy data
-        xor     eax, eax
-        ret
-; read offset - (file size - offset)
-.no_full:
+        mov     ebx, [esp]
+        mov     esi, [esp + 3*4]
+        add     esp, 4*4
+        call    kernel_free
 
-        mov     eax, 6
+        mov     eax, esi
         ret
 
+.err_disk_1:
+        stdcall kernel_free, ebx
+.err_disk:
+        add     esp, 4*4
+        call    kernel_free
+        xor     ebx, ebx
+        mov     eax, 11 ; device error
+        ret
+.err_memory:
+        add     esp, 4*4
+        call    kernel_free
+        xor     ebx, ebx
+        mov     eax, 12
+        ret
 
 
 ; FAT external functions
@@ -291,23 +423,20 @@ iso9660_ReadFolder:
         test    byte[eax + ISO9660_DIRECTORY_RECORD.flags], 10b ; check dir
         jz      iso9660_find_file.not_found
 
+        ; create buffer for read sectors
+
         ; check index file in dir
 
         ; loop copy file info and name
+.new_file:
 
-                ; copy flags
+        call    iso9660_GetFileInfo.copy_file_info
 
-                ; copy encoding
+        ; copy encoding
 
-                ; copy date create
+        ; copy name
 
-                ; copy date modiffed
-
-                ; copy size
-
-                ; copy name
-
-
+        ; free buffer
 
         ret
 
@@ -325,14 +454,63 @@ iso9660_GetFileInfo:
         sub     esp, 4 ; for ptr on memory page
         call    iso9660_find_file
 
+        mov     ecx, [ebx + 16] ; buffer
+
+        call    .copy_file_info
+
+        call    kernel_free
+        xor     eax, eax
+        mov     ebx, 40
+        ret
+
+;  IN: eax -> ISO966_DIRECTORY_RECORD
+;      ecx -> buffer
+; destruct: edx
+.copy_file_info:
         ; copy flags(dir of file)
+        xor     edx, edx
+        or      dl, 100001b
+        test    byte[eax + ISO9660_DIRECTORY_RECORD.flags], 1b ; check hidden flag
+        jz      @f
+        or      dl, 10b
+@@:
+        test    byte[eax + ISO9660_DIRECTORY_RECORD.flags], 10b ; check dir
+        jz      @f
+        and     dl, not 1b
+        or      dl, 10000b ; dir flag
+@@:
+        mov     [ecx], edx
         ; copy size
+        mov     [ecx + 36], 0
+        mov     edx, [eax + ISO9660_DIRECTOEY_RECORD.data_length]
+        mov     [ecx + 32], edx
+
+        ; copy date creat file
+        movzx   edx, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time]
+        add     edx, 1900 ; year
+        shl     edx, 8
+
+        mov     dl, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time + 1] ;month
+        shl     edx, 8
+        mov     dl, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time + 2] ;day
+
+        mov     [ecx + 12], edx
+        mov     [ecx + 20], edx
+        mov     [ecx + 28], edx
 
         ; copy time creat file
-        ; copy date creat
-        ;      date last edited
+        movzx   edx, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time + 3] ;hour
+        shl     edx, 8
+        mov     dl, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time + 4] ; minute
+        shl     edx, 8
+        mov     dl, byte[eax + ISO9660_DIRECTOEY_RECORD.date_time + 5] ; second
+
+        mov     [ecx + 8], edx
+        mov     [ecx + 16], edx
+        mov     [ecx + 24], edx
 
         ret
+
 .rootdir:
         mov     edi, [ebx + 16] ; edi = buffer
         ; copy flags (dir)
@@ -347,11 +525,6 @@ iso9660_GetFileInfo:
         shl     eax, cl
         mov     [edi + 32], eax  ; bdfe.size.lo
         mov     [edi + 36], edx  ; bdfe.size.hi
-
-        ;; read primary descriptor
-        ;
-        ;; copy date creat
-        ;; copy date last edited
 
         mov     eax, [ebx + 8]
         ; copy encoding
@@ -408,7 +581,7 @@ iso9660_GetFileInfo:
 
 ; IN: esi - ptr string UTF-8 or zero for root directory
 ; OUT: eax - ptr to directory record
-;      [esp] - ptr to memory page for destruct
+;      [esp + 4] - ptr to memory page for destruct
 iso9660_find_file:
         cmp     byte[esi], 0
         jz      .rootdir
